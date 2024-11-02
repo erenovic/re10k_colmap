@@ -12,3 +12,22 @@ For sparse reconstruction, you can use either `all` or specific `scene_id` for R
 For the dataset, this repository uses the compressed format with `.torch` extension. A subset of the dataset can be downloaded from [here](https://drive.google.com/drive/folders/1joiezNCyQK2BvWMnfwHJpm2V77c7iYGe?usp=sharing).
 
 For further information on dataset, please refer to [Re10K documentation](https://google.github.io/realestate10k/).
+
+### Dataset structure
+
+The dataset should be structured as follows:
+```
+re10k_subset
+├── test
+│   ├── 000000.torch
+│   ├── 000001.torch
+│   ├── 000002.torch
+│   └── index.json
+└── train
+    ├── 000000.torch
+    ├── 000001.torch
+    ├── 000002.torch
+    └── index.json
+```
+
+Note again that the actual dataset is huge and this tree only contains the subset provided by [pixelSplat](https://davidcharatan.com/pixelsplat/)
