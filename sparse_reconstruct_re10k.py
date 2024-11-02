@@ -46,6 +46,9 @@ CAMERA_MODEL_NAMES = dict([(camera_model.model_name, camera_model)
                            for camera_model in CAMERA_MODELS])
 
 
+SAVE_DIR = lambda scene_id: f"scenes/{scene_id}"
+
+
 class COLMAPImage(BaseImage):
     def qvec2rotmat(self):
         return qvec2rotmat(self.qvec)
@@ -248,10 +251,13 @@ def load_sample(data_path: str, chosen_sample_key: str):
     chunk_id = 0
     chunk = torch.load(train_dir / f'{chunk_id:06d}.torch')
 
-    all_cam_infos = []
-    samples = {}
+    processed_samples = []
 
     for sample in chunk:
+        save_dir = SAVE_DIR(sample['key'])
+        if os.path.exists(save_dir):
+            os.system(f"rm -rf {save_dir}")
+        os.makedirs(save_dir, exist_ok=True)
 
         if (sample['key'] != chosen_sample_key) and chosen_sample_key != "all":
             continue
@@ -265,23 +271,29 @@ def load_sample(data_path: str, chosen_sample_key: str):
         # print(cam_infos)
         print(images.shape)
 
-        if sample['key'] not in samples:
-            samples[sample['key']] = {
+        if sample['key'] not in processed_samples:
+            processed_samples.append(sample['key'])
+            yield_sample = {
+                'key': sample['key'],
                 'images': images,
                 'cameras': cam_infos
             }
         else:
             print(f"Sample {sample['key']} already exists!")
+            continue
 
+        save_dir = SAVE_DIR(sample['key'])
         os.makedirs(f"{save_dir}/images", exist_ok=True)
         for idx, cam_info in enumerate(cam_infos):
             pil_image = cam_info['image']
             pil_image.save(f"{save_dir}/images/{idx:04d}.png")
             
-    return samples
+        yield yield_sample
 
 
-def write_colmap_cameras_and_images(save_dir: str, samples: dict, chosen_sample_key: str):
+def write_colmap_cameras_and_images(sample: dict, chosen_sample_key: str):
+    save_dir = SAVE_DIR(sample['key'])
+
     os.makedirs(f"{save_dir}/sparse", exist_ok=True)
 
     if os.path.exists(f"{save_dir}/sparse/cameras.txt"):
@@ -305,78 +317,80 @@ def write_colmap_cameras_and_images(save_dir: str, samples: dict, chosen_sample_
     extr_template = lambda idx, qw, qx, qy, qz, tx, ty, tz, cam_id, name: \
         f"{idx} {qw} {qx} {qy} {qz} {tx} {ty} {tz} {cam_id} {name}"
 
-    for key, sample in samples.items():
+    key = sample['key']
+
+    if (key != chosen_sample_key) and (chosen_sample_key != "all"):
+        raise ValueError("Invalid sample key!")
+
+    print(f"Sample {key} has {len(sample['cameras'])} cameras")
+    for cam_info, image in zip(sample['cameras'], sample['images']):
         
-        if (key != chosen_sample_key) and (chosen_sample_key != "all"):
-            continue
+        ### Write camera intrinsics to cameras.txt
+        focal_length = (
+            cam_info['intrinsics'][0, 0].item() + \
+            cam_info['intrinsics'][1, 1].item()
+        ) / 2.0
 
-        print(f"Sample {key} has {len(sample['cameras'])} cameras")
-        for cam_info, image in zip(sample['cameras'], sample['images']):
-            
-            ### Write camera intrinsics to cameras.txt
-            focal_length = (
-                cam_info['intrinsics'][0, 0].item() + \
-                cam_info['intrinsics'][1, 1].item()
-            ) / 2.0
+        cam_line = intr_template(
+            cam_info['uid'] + 1, 
+            cam_info['width'], 
+            cam_info['height'], 
+            f"{focal_length:.2f}", 
+            int(cam_info['intrinsics'][0, 2].item()), 
+            int(cam_info['intrinsics'][1, 2].item())
+        )
 
-            cam_line = intr_template(
-                cam_info['uid'] + 1, 
-                cam_info['width'], 
-                cam_info['height'], 
-                f"{focal_length:.2f}", 
-                int(cam_info['intrinsics'][0, 2].item()), 
-                int(cam_info['intrinsics'][1, 2].item())
-            )
+        # Write cameras to cameras.txt
+        with open(f"{save_dir}/sparse/cameras.txt", 'a') as file:
+            file.write(cam_line + '\n')
 
-            # Write cameras to cameras.txt
-            with open(f"{save_dir}/sparse/cameras.txt", 'a') as file:
-                file.write(cam_line + '\n')
+        ### Write camera extrinsics to images.txt
+        # print(cam_info['R'], cam_info['image_name'])
+        quat = rotmat2qvec(cam_info['R'])
+        trans = cam_info['T']
 
-            ### Write camera extrinsics to images.txt
-            # print(cam_info['R'], cam_info['image_name'])
-            quat = rotmat2qvec(cam_info['R'])
-            trans = cam_info['T']
+        extr_line = extr_template(
+            cam_info['uid'] + 1, 
+            quat[0], quat[1], quat[2], quat[3], 
+            trans[0], trans[1], trans[2], 
+            cam_info['uid'] + 1, 
+            f"{cam_info['uid']:04d}.png"
+        )
 
-            extr_line = extr_template(
-                cam_info['uid'] + 1, 
-                quat[0], quat[1], quat[2], quat[3], 
-                trans[0], trans[1], trans[2], 
-                cam_info['uid'] + 1, 
-                f"{cam_info['uid']:04d}.png"
-            )
-
-            # Write extrinsics to images.txt
-            with open(f"{save_dir}/sparse/images.txt", 'a') as file:
-                file.write(extr_line + '\n')
-                file.write('\n')
+        # Write extrinsics to images.txt
+        with open(f"{save_dir}/sparse/images.txt", 'a') as file:
+            file.write(extr_line + '\n')
+            file.write('\n')
 
 
-def update_colmap_database_w_intrinsics(save_dir: str, samples: dict, chosen_sample_key: str):
+def update_colmap_database_w_intrinsics(sample: dict, chosen_sample_key: str):
+    save_dir = SAVE_DIR(sample['key'])
+
     database_path = f"{save_dir}/database.db"
     pycolmap_database = pycolmap.Database(database_path)
 
-    for key, sample in samples.items():
-        if key != chosen_sample_key:
-            continue
+    key = sample['key']
+    if (key != chosen_sample_key) and (chosen_sample_key != "all"):
+        raise ValueError("Invalid sample key!")
 
-        print(f"Sample {key} has {len(sample['cameras'])} cameras")
+    print(f"Sample {key} has {len(sample['cameras'])} cameras")
 
-        for cam_info, image in zip(sample['cameras'], sample['images']):
-            
-            ### Write camera intrinsics to cameras.txt
-            focal_length = (
-                cam_info['intrinsics'][0, 0].item() + \
-                cam_info['intrinsics'][1, 1].item()
-            ) / 2.0
+    for cam_info, image in zip(sample['cameras'], sample['images']):
+        
+        ### Write camera intrinsics to cameras.txt
+        focal_length = (
+            cam_info['intrinsics'][0, 0].item() + \
+            cam_info['intrinsics'][1, 1].item()
+        ) / 2.0
 
-            cam = pycolmap.Camera.create(
-                camera_id=cam_info['uid'] + 1,
-                model=0,        #SIMPLE_PINHOLE
-                focal_length=focal_length,
-                width=cam_info['width'],
-                height=cam_info['height']
-            )
-            pycolmap_database.update_camera(cam)
+        cam = pycolmap.Camera.create(
+            camera_id=cam_info['uid'] + 1,
+            model=0,        #SIMPLE_PINHOLE
+            focal_length=focal_length,
+            width=cam_info['width'],
+            height=cam_info['height']
+        )
+        pycolmap_database.update_camera(cam)
 
     print(f"Updated cameras in the database at {database_path}!")
     pycolmap_database.close()
@@ -391,68 +405,69 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     chosen_sample_key = args.scene_id
-    save_dir = f"scene_{chosen_sample_key}"
 
-    if os.path.exists(save_dir):
-        os.system(f"rm -rf {save_dir}")
-    os.makedirs(save_dir, exist_ok=True)
+    for sample in load_sample(args.data_path, chosen_sample_key):
+        save_dir = SAVE_DIR(sample['key'])
 
-    # Prepare the sample data for COLMAP
-    samples = load_sample(args.data_path, chosen_sample_key)
-    write_colmap_cameras_and_images(save_dir, samples, chosen_sample_key)
+        # if os.path.exists(save_dir):
+        #     os.system(f"rm -rf {save_dir}")
+        # os.makedirs(save_dir, exist_ok=True)
 
-    # Extract features using COLMAP
-    try:
-        os.remove(f"{save_dir}/database.db")
-        os.remove(f"{save_dir}/database.db-shm")
-        os.remove(f"{save_dir}/database.db-wal")
-    except:
-        print("Database files do not exist!")
+        # Prepare the sample data for COLMAP
+        write_colmap_cameras_and_images(sample, chosen_sample_key)
 
-    os.system(f"""
-    colmap feature_extractor \
-        --ImageReader.camera_model SIMPLE_PINHOLE \
-        --database_path {save_dir}/database.db \
-        --image_path {save_dir}/images
-    """
-    )
+        # Extract features using COLMAP
+        try:
+            os.remove(f"{save_dir}/database.db")
+            os.remove(f"{save_dir}/database.db-shm")
+            os.remove(f"{save_dir}/database.db-wal")
+        except:
+            print("Database files do not exist!")
 
-    # Update the database with intrinsics
-    update_colmap_database_w_intrinsics(save_dir, samples, chosen_sample_key)
+        os.system(f"""
+        colmap feature_extractor \
+            --ImageReader.camera_model SIMPLE_PINHOLE \
+            --database_path {save_dir}/database.db \
+            --image_path {save_dir}/images
+        """
+        )
 
-    # Match features using COLMAP
-    os.system(f"colmap exhaustive_matcher --database_path {save_dir}/database.db")
+        # Update the database with intrinsics
+        update_colmap_database_w_intrinsics(sample, chosen_sample_key)
 
-    # Perform sparse reconstruction using COLMAP (triangulation)
-    os.system(f"""
-    colmap point_triangulator \
-        --database_path {save_dir}/database.db \
-        --image_path {save_dir}/images \
-        --input_path {save_dir}/sparse/ \
-        --output_path {save_dir}/sparse/"""
-    )
+        # Match features using COLMAP
+        os.system(f"colmap exhaustive_matcher --database_path {save_dir}/database.db")
 
-    # Check point cloud statistics
-    xyzs, rgbs, errors = read_points3D_binary(f"{save_dir}/sparse/points3D.bin")
-    print(f"Point cloud binary saved at {save_dir}/sparse/points3D.bin")
-    print(f"Number of points: {len(xyzs)}")
+        # Perform sparse reconstruction using COLMAP (triangulation)
+        os.system(f"""
+        colmap point_triangulator \
+            --database_path {save_dir}/database.db \
+            --image_path {save_dir}/images \
+            --input_path {save_dir}/sparse/ \
+            --output_path {save_dir}/sparse/"""
+        )
+
+        # Check point cloud statistics
+        xyzs, rgbs, errors = read_points3D_binary(f"{save_dir}/sparse/points3D.bin")
+        print(f"Point cloud binary saved at {save_dir}/sparse/points3D.bin")
+        print(f"Number of points: {len(xyzs)}")
 
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(xyzs)
-    pcd.colors = o3d.utility.Vector3dVector(rgbs / 255.0)
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(xyzs)
+        pcd.colors = o3d.utility.Vector3dVector(rgbs / 255.0)
 
-    # Save the point cloud to a ply file
-    o3d.io.write_point_cloud(f"{save_dir}/points3D.ply", pcd)
-    print(f"Point cloud saved at {save_dir}/points3D.ply")
+        # Save the point cloud to a ply file
+        o3d.io.write_point_cloud(f"{save_dir}/points3D.ply", pcd)
+        print(f"Point cloud saved at {save_dir}/points3D.ply")
 
-    # Move data to 0 folder
-    os.makedirs(f"{save_dir}/sparse/0", exist_ok=True)
-    os.system(f"mv {save_dir}/sparse/*.txt {save_dir}/sparse/0/")
-    os.system(f"mv {save_dir}/sparse/*.bin {save_dir}/sparse/0/")
+        # Move data to 0 folder
+        os.makedirs(f"{save_dir}/sparse/0", exist_ok=True)
+        os.system(f"mv {save_dir}/sparse/*.txt {save_dir}/sparse/0/")
+        os.system(f"mv {save_dir}/sparse/*.bin {save_dir}/sparse/0/")
 
-    print(f"Data saved at {save_dir}/sparse/0/")
-    print("     Data saved in the correct format for COLMAP initialization in Gaussian Splatting!")
+        print(f"Data saved at {save_dir}/sparse/0/")
+        print("     Data saved in the correct format for COLMAP initialization in Gaussian Splatting!")
 
 
     
